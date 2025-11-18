@@ -13,6 +13,19 @@ from dotenv import load_dotenv
 import requests
 import aiohttp
 
+from datetime import datetime, timezone, timedelta
+
+# --- KST 유틸 ---
+KST = timezone(timedelta(hours=9))
+
+def now_kst() -> datetime:
+    """항상 KST 기준 현재 시각 반환."""
+    return datetime.now(timezone.utc).astimezone(KST)
+
+def today_kst_yyyymmdd() -> str:
+    """오늘 날짜를 KST 기준 YYYYMMDD로 반환."""
+    return now_kst().strftime("%Y%m%d")
+
 # --- 로깅 설정 ---
 logging.basicConfig(
     level=logging.INFO,
@@ -98,10 +111,10 @@ def get_or_create_guild_settings(guild_id: int) -> Dict[str, Any]:
     if guild_id not in guild_settings:
         guild_settings[guild_id] = {
             "channel_id": None,
-            "post_hour": 8,          # 기본 자동 발사 시간: 08:00
+            "post_hour": 8,          # 기본 자동 발사 시간: 08:00 (KST)
             "post_minute": 0,
             "gemini_api_key": "",
-            "last_post_date": None,  # YYYYMMDD
+            "last_post_date": None,  # YYYYMMDD (KST)
             "mention_mode": "none",  # none / everyone / role
             "mention_role_id": None,
         }
@@ -223,10 +236,11 @@ async def translate_text(
 
 # --- 오하아사 JSON 가져오기 ---
 
-def fetch_horoscope_data_sync() -> Optional[str]:
+def fetch_horoscope_data_sync():
     """
-    오하아사 공식 JSON API에서 오늘자 운세 데이터를 가져와
-    일본어 JSON 문자열로 반환한다.
+    오하아사 공식 JSON API에서 별자리 랭킹 데이터를 가져와서
+    Gemini 번역용 일본어 JSON 문자열로 반환.
+    - onair_date가 오늘(KST)과 다르면 None을 반환하여 '어제자 데이터'를 막는다.
     """
     logging.info("운세 데이터(JSON) 가져오기 시작")
 
@@ -248,7 +262,7 @@ def fetch_horoscope_data_sync() -> Optional[str]:
     try:
         headers = {
             "User-Agent": "Mozilla/5.0",
-            "Accept": "application/json,text/javascript,*/*;q=0.01",
+            "Accept": "application/json, text/javascript,*/*;q=0.01",
             "Referer": OHAASA_URL,
         }
         resp = requests.get(OHAASA_JSON_URL, headers=headers, timeout=15)
@@ -262,13 +276,27 @@ def fetch_horoscope_data_sync() -> Optional[str]:
             return None
 
         root = data[0]
+
+        # ✅ onair_date가 오늘(KST)인지 확인
+        onair_date = root.get("onair_date")
+        today_str = today_kst_yyyymmdd()
+        logging.info(f"API onair_date={onair_date}, today(KST)={today_str}")
+
+        if onair_date != today_str:
+            logging.warning(
+                f"오하아사 JSON이 아직 오늘자로 갱신되지 않았습니다. "
+                f"(onair_date={onair_date}, today={today_str})"
+            )
+            # 여기서 None을 반환하면 위쪽 로직이 "오늘자 데이터 없음"으로 처리하고 재시도하게 만들 수 있음
+            return None
+
         details = root.get("detail", [])
         logging.info(f"JSON에서 detail 항목 {len(details)}개 발견.")
 
         if len(details) != 12:
             logging.warning(f"경고: detail 개수가 12개가 아닙니다. 실제 개수: {len(details)}")
 
-        result = []
+        horoscopes_japanese = []
 
         for idx, d in enumerate(details):
             try:
@@ -282,30 +310,25 @@ def fetch_horoscope_data_sync() -> Optional[str]:
 
                 rank = f"{rank_str}位"
                 sign_jp = SIGN_CODE_TO_JP.get(sign_code, f"不明な星座({sign_code})")
-                description = text.replace("\t", " ").strip()
+                description = text.replace('\t', ' ').strip()
 
-                result.append(
-                    {
-                        "rank": rank,
-                        "sign_jp": sign_jp,
-                        "description_jp": description,
-                    }
-                )
-
+                horoscopes_japanese.append({
+                    "rank": rank,
+                    "sign_jp": sign_jp,
+                    "description_jp": description
+                })
             except Exception as e:
                 logging.error(f"{idx}번째 detail 처리 중 오류: {e}")
                 continue
 
-        if not result:
+        if not horoscopes_japanese:
             logging.error("JSON에서 유효한 운세 데이터를 하나도 만들지 못했습니다.")
             return None
 
-        if len(result) != 12:
-            logging.warning(
-                f"경고: 12개가 아닌 {len(result)}개의 운세만 수집되었습니다."
-            )
+        if len(horoscopes_japanese) != 12:
+            logging.warning(f"경고: 12개가 아닌 {len(horoscopes_japanese)}개의 운세만 수집됨.")
 
-        return json.dumps(result, ensure_ascii=False, indent=2)
+        return json.dumps(horoscopes_japanese, ensure_ascii=False, indent=2)
 
     except requests.exceptions.RequestException as e:
         logging.error(f"운세 JSON API 요청 중 오류: {e}")
@@ -314,16 +337,17 @@ def fetch_horoscope_data_sync() -> Optional[str]:
         logging.error(f"운세 JSON 처리 중 알 수 없는 오류: {e}")
         return None
 
+
 async def get_today_horoscope_for_guild(
     guild_id: int,
     gemini_api_key: str,
 ) -> Optional[Any]:
     """
-    해당 길드 기준으로 '오늘자 번역된 운세'를 가져온다.
+    해당 길드 기준으로 '오늘자 번역된 운세'를 가져온다 (KST 기준).
     - 이미 오늘자 데이터가 캐시에 있으면 그대로 반환
     - 없으면 JSON 요청 + Gemini 번역 후 캐시에 넣고 반환
     """
-    today = time.strftime("%Y%m%d", time.localtime())
+    today = today_kst_yyyymmdd()
 
     # 1) 캐시 확인 (락 잡고 짧게)
     async with cache_lock:
@@ -337,7 +361,7 @@ async def get_today_horoscope_for_guild(
 
     japanese_json_data = await asyncio.to_thread(fetch_horoscope_data_sync)
     if not japanese_json_data or japanese_json_data == "[]":
-        logging.error("운세 JSON 로드 실패")
+        logging.error("운세 JSON 로드 실패 또는 오늘자로 미갱신")
         return None
 
     translated_data = await translate_text(japanese_json_data, gemini_api_key)
@@ -366,6 +390,7 @@ async def fetch_and_post_horoscope(
     """
     오하아사 JSON을 받아 Gemini로 번역한 뒤
     지정된 채널에 운세를 게시한다.
+    - JSON onair_date가 오늘이 아니면 '아직 갱신 안 됨' 메시지 출력
     """
     loading_content = "✨ **[오하아사 별자리 운세]** 데이터를 가져오는 중입니다..."
     if mention_text:
@@ -373,7 +398,7 @@ async def fetch_and_post_horoscope(
 
     loading_message = await channel.send(loading_content)
 
-    # 1+2. 캐시 포함 '오늘자 번역된 운세' 가져오기
+    # 길드 ID 추론
     if guild_id is None and hasattr(channel, "guild") and channel.guild:
         guild_id = channel.guild.id
 
@@ -383,18 +408,22 @@ async def fetch_and_post_horoscope(
         )
         return
 
+    # 1+2. 캐시 포함 '오늘자 번역된 운세' 가져오기
     translated_data = await get_today_horoscope_for_guild(guild_id, gemini_api_key)
 
     if not translated_data:
+        # 이 시점에서 대부분은 onair_date 미갱신 또는 Gemini 오류
         await loading_message.edit(
-            content="❌ 오늘자 운세 데이터를 불러오지 못했습니다. (JSON 또는 Gemini 오류)"
+            content=(
+                "❌ 오늘자 오하아사 운세 데이터를 불러오지 못했습니다.\n"
+                "사이트 JSON이 아직 오늘자로 갱신되지 않았거나, Gemini 번역 중 오류가 발생했을 수 있습니다."
+            )
         )
         return
 
-
     # 3. 디스코드 Embed + 스레드로 게시
     try:
-        date_str = time.strftime("%Y년 %m월 %d일", time.localtime())
+        date_str = now_kst().strftime("%Y년 %m월 %d일")
 
         embed = discord.Embed(
             title=f"📅 {date_str} 오늘의 오하아사 별자리 랭킹",
@@ -471,12 +500,13 @@ async def scheduler_loop():
     """
     모든 길드 설정을 기준으로,
     매 분마다 현재 시간이 설정된 시각과 일치하면 자동으로 운세를 게시한다.
+    시간 기준은 항상 KST(UTC+9)를 사용한다.
     """
     await client.wait_until_ready()
-    logging.info("자동 운세 게시 스케줄러 시작")
+    logging.info("자동 운세 게시 스케줄러 시작 (KST 기준)")
 
     while not client.is_closed():
-        now = dt.datetime.now()
+        now = now_kst()
         today_str = now.strftime("%Y%m%d")
 
         for guild_id, cfg in guild_settings.items():
@@ -486,12 +516,15 @@ async def scheduler_loop():
             gemini_key = cfg.get("gemini_api_key")
             last_post_date = cfg.get("last_post_date")
 
-            if channel_id is None or gemini_key is None:
+            # 채널/키 미설정 시 스킵
+            if not channel_id or not gemini_key:
                 continue
 
+            # 이미 오늘 올렸으면 스킵
             if last_post_date == today_str:
                 continue
 
+            # 설정한 시간과 현재 KST 시간이 일치할 때만 발사
             if now.hour == int(hour) and now.minute == int(minute):
                 channel = client.get_channel(int(channel_id))
                 if not channel:
@@ -511,7 +544,7 @@ async def scheduler_loop():
                     mention_text = f"<@&{int(role_id)}>"
 
                 logging.info(
-                    f"길드 {guild_id}에 대해 자동 운세 게시 실행 (채널 {channel_id})"
+                    f"길드 {guild_id}에 대해 자동 운세 게시 실행 (채널 {channel_id}, {hour:02d}:{minute:02d} KST)"
                 )
                 client.loop.create_task(
                     fetch_and_post_horoscope(channel, gemini_key, mention_text, guild_id)
@@ -538,17 +571,19 @@ async def on_ready():
         logging.info(f"현재 {len(client.guilds)}개의 서버에 연결됨")
         logging.info("------")
 
+        # 자동 스케줄러 시작
         client.loop.create_task(scheduler_loop())
+
+        # 미리 오늘자 데이터 캐싱 시도 (옵셔널)
+        for guild in client.guilds:
+            cfg = get_guild_settings(guild.id)
+            if cfg and cfg.get("gemini_api_key"):
+                client.loop.create_task(
+                    get_today_horoscope_for_guild(guild.id, cfg["gemini_api_key"])
+                )
 
     except Exception as e:
         logging.error(f"on_ready 중 오류: {e}")
-        
-    for guild in client.guilds:
-        cfg = get_guild_settings(guild.id)
-        if cfg and cfg.get("gemini_api_key"):
-            client.loop.create_task(
-                get_today_horoscope_for_guild(guild.id, cfg["gemini_api_key"])
-            )
 
 
 # --- /hello 테스트용 간단 명령 ---
@@ -624,7 +659,7 @@ class Ohaasa(app_commands.Group):
     # /ohaasa time
     @app_commands.command(
         name="time",
-        description="매일 자동으로 운세를 게시할 시간을 설정합니다. (24시간 기준)",
+        description="매일 자동으로 운세를 게시할 시간을 설정합니다. (24시간 기준, KST)",
     )
     @app_commands.checks.has_permissions(manage_guild=True)
     async def time_cmd(
@@ -645,8 +680,8 @@ class Ohaasa(app_commands.Group):
         save_guild_config()
 
         await interaction.response.send_message(
-            f"✅ 매일 **{hour:02d}:{minute:02d}** 에 자동으로 오하아사 운세를 게시하도록 설정했습니다.\n"
-            "시간 기준은 **봇이 실행 중인 서버의 로컬 시간**입니다.",
+            f"✅ 매일 **{hour:02d}:{minute:02d} (KST)** 에 자동으로 오하아사 운세를 게시하도록 설정했습니다.\n"
+            "시간 기준은 **한국 표준시(KST, UTC+9)** 입니다.",
             ephemeral=True,
         )
 
@@ -751,10 +786,10 @@ class Ohaasa(app_commands.Group):
             color=0x4E72B7,
         )
         embed.add_field(name="게시 채널", value=channel_mention, inline=False)
-        embed.add_field(name="자동 게시 시간", value=time_str, inline=False)
+        embed.add_field(name="자동 게시 시간 (KST)", value=time_str, inline=False)
         embed.add_field(name="Gemini API 키", value=gemini_status, inline=False)
         embed.add_field(name="멘션 설정", value=mention_str, inline=False)
-        embed.add_field(name="마지막 자동 게시 날짜", value=last_post, inline=False)
+        embed.add_field(name="마지막 자동 게시 날짜 (KST)", value=last_post, inline=False)
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -823,8 +858,7 @@ class Ohaasa(app_commands.Group):
             gemini_key,
             mention_text,
             interaction.guild.id,
-)
-
+        )
 
 
 # 그룹을 트리에 등록
