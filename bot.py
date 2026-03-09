@@ -6,12 +6,14 @@ import asyncio
 import logging
 import datetime as dt
 from typing import Dict, Any, Optional
+import re  # <--- 이 줄 추가
 
 import discord
 from discord import app_commands
 from dotenv import load_dotenv
 import requests
 import aiohttp
+from bs4 import BeautifulSoup
 
 from datetime import datetime, timezone, timedelta
 
@@ -55,7 +57,7 @@ OHAASA_URL = "https://www.asahi.co.jp/ohaasa/week/horoscope/"
 OHAASA_JSON_URL = "https://www.asahi.co.jp/data/ohaasa2020/horoscope.json"
 GEMINI_API_URL = (
     "https://generativelanguage.googleapis.com/v1beta/"
-    "models/gemini-2.5-flash-preview-09-2025:generateContent"
+    "models/gemini-2.5-flash:generateContent"
 )
 
 GUILD_CONFIG_PATH = "guild_config.json"
@@ -69,8 +71,11 @@ tree = app_commands.CommandTree(client)
 guild_settings: Dict[int, Dict[str, Any]] = {}
 
 # 길드별 오늘 운세 캐시: { guild_id: { "date": "YYYYMMDD", "data": [ ...translated... ] } }
-horoscope_cache: Dict[int, Dict[str, Any]] = {}
+# 기존: horoscope_cache: Dict[int, Dict[str, Any]] = {}
+# 변경: 날짜별로 딱 하나만 저장
+horoscope_cache: Dict[str, Any] = {}
 cache_lock = asyncio.Lock()
+fetch_lock = asyncio.Lock() # <--- 데이터 로딩 자체를 보호할 락 추가
 
 
 # --- 길드 설정 로드/저장 ---
@@ -138,26 +143,22 @@ def is_guild_owner():
 # --- Gemini 번역 함수 (재시도 포함) ---
 
 async def translate_text(
-    japanese_json_text: str,
+    japanese_text: str,
     gemini_api_key: str,
     max_retries: int = 3,
 ) -> Optional[Any]:
-    """
-    Gemini API를 사용해 일본어 운세 JSON 문자열을
-    한국어로 번역된 JSON(List[Object])으로 반환한다.
-    500에러 등 서버 내부 오류 시 자동 재시도.
-    """
     if not gemini_api_key:
-        logging.error("Gemini API 키가 설정되어 있지 않습니다.")
         return None
 
     system_prompt = (
         "You are an expert translator specializing in Japanese-to-Korean horoscopes. "
-        "The input is a JSON string containing horoscope rankings and descriptions in Japanese. "
-        "Translate ALL Japanese text into natural, easy-to-read Korean. "
-        "Keep the structure (rank, sign, description) and output a JSON array of objects with "
-        "fields: rank, sign_ko, description_ko. "
-        "Return ONLY the raw JSON array."
+        "Your goal is to translate Japanese horoscope content into natural, friendly Korean that maintains the original's energetic and positive tone. "
+        "1. Keep exclamation marks (!), hearts, or other expressive punctuation if present in the original text. "
+        "2. Translate into '해요체', ensuring the tone sounds like a fun, daily horoscope reading. "
+        "3. IMPORTANT: The 'description_ko' field MUST ONLY contain the horoscope advice. "
+        "4. DO NOT include any 'Lucky Color', 'Lucky Item', or 'Scores' in the 'description_ko' field. Extract ONLY the advice text. "
+        "5. Extract exactly 12 rankings. "
+        "6. Return ONLY the raw JSON array of 12 objects."
     )
 
     response_schema = {
@@ -165,25 +166,16 @@ async def translate_text(
         "items": {
             "type": "OBJECT",
             "properties": {
-                "rank": {
-                    "type": "STRING",
-                    "description": "Ranking in Korean, e.g. '1위'"
-                },
-                "sign_ko": {
-                    "type": "STRING",
-                    "description": "Korean name of the zodiac sign, e.g. '양자리'"
-                },
-                "description_ko": {
-                    "type": "STRING",
-                    "description": "Full horoscope description in Korean"
-                },
+                "rank": {"type": "INTEGER", "description": "Ranking (1 to 12)"},
+                "sign_ko": {"type": "STRING", "description": "Korean zodiac sign"},
+                "description_ko": {"type": "STRING", "description": "Horoscope text"}
             },
             "required": ["rank", "sign_ko", "description_ko"],
         },
     }
 
     payload = {
-        "contents": [{"parts": [{"text": japanese_json_text}]}],
+        "contents": [{"parts":[{"text": japanese_text}]}],
         "systemInstruction": {"parts": [{"text": system_prompt}]},
         "generationConfig": {
             "responseMimeType": "application/json",
@@ -196,188 +188,134 @@ async def translate_text(
     for attempt in range(max_retries):
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{GEMINI_API_URL}?key={gemini_api_key}",
-                    headers=headers,
-                    json=payload,
-                ) as resp:
+                async with session.post(f"{GEMINI_API_URL}?key={gemini_api_key}", headers=headers, json=payload) as resp:
                     if resp.status == 200:
                         result = await resp.json()
-                        json_string = result["candidates"][0]["content"]["parts"][0]["text"]
+                        json_string = result["candidates"][0]["content"]["parts"][0]["text"].strip()
+                        if json_string.startswith("```"):
+                            json_string = json_string.strip("`").replace("json", "", 1).strip()
                         return json.loads(json_string)
 
-                    # 5xx → 재시도 대상
                     if 500 <= resp.status < 600:
-                        error_text = await resp.text()
-                        logging.error(
-                            f"Gemini API 서버 오류 (Status {resp.status}, 시도 {attempt+1}/{max_retries}): {error_text}"
-                        )
                         if attempt < max_retries - 1:
-                            await asyncio.sleep(1 + attempt)  # 백오프
+                            await asyncio.sleep(1 + attempt)
                             continue
-                        return None
-
-                    # 그 외 상태코드는 재시도하지 않고 종료
-                    error_text = await resp.text()
-                    logging.error(
-                        f"Gemini API 오류 (Status {resp.status}): {error_text}"
-                    )
                     return None
-
         except Exception as e:
-            logging.error(f"Gemini 번역 함수 예외 (시도 {attempt+1}/{max_retries}): {e}")
             if attempt < max_retries - 1:
                 await asyncio.sleep(1 + attempt)
                 continue
             return None
-
     return None
 
 
 # --- 오하아사 JSON 가져오기 ---
 
 def fetch_horoscope_data_sync():
-    """
-    오하아사 공식 JSON API에서 별자리 랭킹 데이터를 가져와서
-    Gemini 번역용 일본어 JSON 문자열로 반환.
-    - onair_date가 오늘(KST)과 다르면 None을 반환하여 '어제자 데이터'를 막는다.
-    """
-    logging.info("운세 데이터(JSON) 가져오기 시작")
-
-    SIGN_CODE_TO_JP = {
-        "01": "牡羊座",
-        "02": "牡牛座",
-        "03": "双子座",
-        "04": "蟹座",
-        "05": "獅子座",
-        "06": "乙女座",
-        "07": "天秤座",
-        "08": "蠍座",
-        "09": "射手座",
-        "10": "山羊座",
-        "11": "水瓶座",
-        "12": "魚座",
-    }
-
+    """오하아사 JSON API를 로드합니다."""
+    logging.info("오하아사 운세 데이터(JSON) 가져오기 시작")
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "application/json, text/javascript,*/*;q=0.01",
-            "Referer": OHAASA_URL,
-        }
+        headers = {"User-Agent": "Mozilla/5.0"}
         resp = requests.get(OHAASA_JSON_URL, headers=headers, timeout=15)
         resp.raise_for_status()
-        logging.info("JSON API 접속 성공")
-
+        
         data = resp.json()
-
         if not isinstance(data, list) or not data:
-            logging.error("JSON 최상위 구조가 기대와 다릅니다 (list가 아니거나 비어 있음).")
             return None
 
         root = data[0]
-
-        # ✅ onair_date가 오늘(KST)인지 확인
         onair_date = root.get("onair_date")
-        today_str = today_kst_yyyymmdd()
-        logging.info(f"API onair_date={onair_date}, today(KST)={today_str}")
-
-        if onair_date != today_str:
-            logging.warning(
-                f"오하아사 JSON이 아직 오늘자로 갱신되지 않았습니다. "
-                f"(onair_date={onair_date}, today={today_str})"
-            )
-            # 여기서 None을 반환하면 위쪽 로직이 "오늘자 데이터 없음"으로 처리하고 재시도하게 만들 수 있음
+        if onair_date != today_kst_yyyymmdd():
             return None
 
-        details = root.get("detail", [])
-        logging.info(f"JSON에서 detail 항목 {len(details)}개 발견.")
+        details = root.get("detail",[])
+        
+        # 이전처럼 파이썬에서 하나하나 텍스트를 자르지 않고, 
+        # 원본 JSON을 그대로 줘서 Gemini가 숨겨진 럭키 아이템이나 색상도 알아서 찾게 만듭니다.
+        return json.dumps(details, ensure_ascii=False)
 
-        if len(details) != 12:
-            logging.warning(f"경고: detail 개수가 12개가 아닙니다. 실제 개수: {len(details)}")
-
-        horoscopes_japanese = []
-
-        for idx, d in enumerate(details):
-            try:
-                rank_str = d.get("ranking_no")
-                sign_code = d.get("horoscope_st")
-                text = d.get("horoscope_text")
-
-                if not (rank_str and sign_code and text):
-                    logging.warning(f"{idx}번째 detail에 필요한 필드가 없습니다: {d}")
-                    continue
-
-                rank = f"{rank_str}位"
-                sign_jp = SIGN_CODE_TO_JP.get(sign_code, f"不明な星座({sign_code})")
-                description = text.replace('\t', ' ').strip()
-
-                horoscopes_japanese.append({
-                    "rank": rank,
-                    "sign_jp": sign_jp,
-                    "description_jp": description
-                })
-            except Exception as e:
-                logging.error(f"{idx}번째 detail 처리 중 오류: {e}")
-                continue
-
-        if not horoscopes_japanese:
-            logging.error("JSON에서 유효한 운세 데이터를 하나도 만들지 못했습니다.")
-            return None
-
-        if len(horoscopes_japanese) != 12:
-            logging.warning(f"경고: 12개가 아닌 {len(horoscopes_japanese)}개의 운세만 수집됨.")
-
-        return json.dumps(horoscopes_japanese, ensure_ascii=False, indent=2)
-
-    except requests.exceptions.RequestException as e:
-        logging.error(f"운세 JSON API 요청 중 오류: {e}")
-        return None
     except Exception as e:
-        logging.error(f"운세 JSON 처리 중 알 수 없는 오류: {e}")
+        logging.error(f"오하아사 JSON 로드 중 오류: {e}")
         return None
 
+def fetch_gogo_data_sync() -> Optional[str]:
+    """고고 별자리 파싱 (초고속 압축 최적화)"""
+    logging.info("고고 별자리 데이터 가져오기 시작")
+    url = "https://www.tv-asahi.co.jp/goodmorning/uranai/"
+    try:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        resp = requests.get(url, headers=headers, timeout=15)
+        resp.raise_for_status()
+        resp.encoding = resp.apparent_encoding
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        
+        # 불필요한 태그 완전 삭제
+        for tag in soup(["script", "style", "header", "footer", "nav", "noscript", "svg", "img", "a"]):
+            tag.decompose()
+            
+        # 정규식을 이용해 모든 공백과 줄바꿈을 하나의 띄어쓰기로 압축 (토큰 낭비 방지)
+        text_content = re.sub(r'\s+', ' ', soup.get_text(strip=True))
+        
+        # 3000자만 넘겨도 핵심 운세 정보는 다 들어갑니다.
+        return text_content[:3000]
+
+    except Exception as e:
+        logging.error(f"고고 별자리 파싱 오류: {e}")
+        return None
 
 async def get_today_horoscope_for_guild(
     guild_id: int,
     gemini_api_key: str,
-) -> Optional[Any]:
-    """
-    해당 길드 기준으로 '오늘자 번역된 운세'를 가져온다 (KST 기준).
-    - 이미 오늘자 데이터가 캐시에 있으면 그대로 반환
-    - 없으면 JSON 요청 + Gemini 번역 후 캐시에 넣고 반환
-    """
+) -> Optional[Dict[str, Any]]:
     today = today_kst_yyyymmdd()
 
-    # 1) 캐시 확인 (락 잡고 짧게)
+    # 1단계: 이미 캐시가 있는지 확인
     async with cache_lock:
-        cached = horoscope_cache.get(guild_id)
-        if cached and cached.get("date") == today and cached.get("data"):
-            logging.info(f"길드 {guild_id} 캐시된 운세 사용")
-            return cached["data"]
+        if horoscope_cache.get(today):
+            return horoscope_cache[today]
 
-    # 2) 캐시에 없으면 새로 로드 + 번역
-    logging.info(f"길드 {guild_id} 오늘자 운세 최초 로드 시작")
+    # 2단계: 캐시가 없으면, 로딩 락을 획득하여 한 번만 로드하도록 함
+    async with fetch_lock:
+        # 락 획득 후 다시 한번 캐시 확인 (다른 길드가 이미 로드했을 수 있으므로)
+        async with cache_lock:
+            if horoscope_cache.get(today):
+                return horoscope_cache[today]
 
-    japanese_json_data = await asyncio.to_thread(fetch_horoscope_data_sync)
-    if not japanese_json_data or japanese_json_data == "[]":
-        logging.error("운세 JSON 로드 실패 또는 오늘자로 미갱신")
+        logging.info(f"===> 오늘자({today}) 운세 단독 로드 시작 (딱 한 번만 실행됨) <==")
+        
+        japanese_data = await asyncio.to_thread(fetch_horoscope_data_sync)
+        if not japanese_data:
+            logging.warning("오하아사 데이터 없음. 고고 별자리 전환.")
+            japanese_data = await asyncio.to_thread(fetch_gogo_data_sync)
+            
+        translated_data = await translate_text(japanese_data, gemini_api_key) if japanese_data else None
+
+        if translated_data:
+            result = {
+                "date": today,
+                "source": "오하아사" if japanese_data else "고 고 별자리",
+                "source_url": OHAASA_URL if japanese_data else "https://www.tv-asahi.co.jp/goodmorning/uranai/",
+                "data": translated_data,
+            }
+            async with cache_lock:
+                horoscope_cache[today] = result
+            return result
+            
         return None
 
-    translated_data = await translate_text(japanese_json_data, gemini_api_key)
-    if not translated_data:
-        logging.error("Gemini 번역 실패")
-        return None
+    result = {
+        "date": today,
+        "source": source_name,
+        "source_url": source_url,
+        "data": translated_data,
+    }
 
-    # 3) 캐시에 저장
+    # 3) 공통 캐시에 저장
     async with cache_lock:
-        horoscope_cache[guild_id] = {
-            "date": today,
-            "data": translated_data,
-        }
+        horoscope_cache[today] = result
 
-    return translated_data
-
+    return result
 
 # --- 디스코드 게시 로직 ---
 
@@ -408,47 +346,42 @@ async def fetch_and_post_horoscope(
         )
         return
 
-    # 1+2. 캐시 포함 '오늘자 번역된 운세' 가져오기
-    translated_data = await get_today_horoscope_for_guild(guild_id, gemini_api_key)
+    # 1+2. 캐시 포함 '오늘자 번역된 운세' 가져오기 (dict 반환)
+    horoscope_info = await get_today_horoscope_for_guild(guild_id, gemini_api_key)
 
-    if not translated_data:
-        # 이 시점에서 대부분은 onair_date 미갱신 또는 Gemini 오류
+    if not horoscope_info:
         await loading_message.edit(
             content=(
-                "❌ 오늘자 오하아사 운세 데이터를 불러오지 못했습니다.\n"
-                "사이트 JSON이 아직 오늘자로 갱신되지 않았거나, Gemini 번역 중 오류가 발생했을 수 있습니다."
+                "❌ 오늘자 운세 데이터를 불러오지 못했습니다.\n"
+                "오하아사/고고 별자리가 모두 갱신되지 않았거나 번역 오류가 발생했을 수 있습니다."
             )
         )
         return
+        
+    # 정보 추출
+    source_name = horoscope_info["source"]
+    source_url = horoscope_info["source_url"]
+    translated_data = horoscope_info["data"]
 
     # 3. 디스코드 Embed + 스레드로 게시
     try:
         date_str = now_kst().strftime("%Y년 %m월 %d일")
 
         embed = discord.Embed(
-            title=f"📅 {date_str} 오늘의 오하아사 별자리 랭킹",
-            description=f"[원문 출처: 아사히 방송 오하아사](<{OHAASA_URL}>)",
-            color=0x4E72B7,
+            title=f"📅 {date_str} 오늘의 {source_name} 랭킹",
+            description=f"[원문 출처: {source_name}](<{source_url}>)",
+            color=0x4E72B7 if source_name == "오하아사" else 0xFF9900,
         )
 
         top_rankings = translated_data[:6]
         bottom_rankings = translated_data[6:]
 
-        top_list = "\n".join(
-            f"**{item['rank']}** — {item['sign_ko']}" for item in top_rankings
-        )
-        bottom_list = "\n".join(
-            f"**{item['rank']}** — {item['sign_ko']}" for item in bottom_rankings
-        )
+        # 메인 Embed에는 깔끔하게 순위와 별자리만 표시 (rank가 숫자로 오기 때문에 '위'를 붙여줌)
+        top_list = "\n".join(f"**{item['rank']}위** — {item['sign_ko']}" for item in top_rankings)
+        bottom_list = "\n".join(f"**{item['rank']}위** — {item['sign_ko']}" for item in bottom_rankings)
 
-        embed.add_field(
-            name="🥇 상위 랭킹 (1위 ~ 6위)", value=top_list or "데이터 없음", inline=True
-        )
-        embed.add_field(
-            name="⬇️ 하위 랭킹 (7위 ~ 12위)",
-            value=bottom_list or "데이터 없음",
-            inline=True,
-        )
+        embed.add_field(name="🥇 상위 랭킹 (1~6위)", value=top_list or "데이터 없음", inline=True)
+        embed.add_field(name="⬇️ 하위 랭킹 (7~12위)", value=bottom_list or "데이터 없음", inline=True)
 
         await loading_message.edit(content=None, embed=embed)
         initial_message = loading_message
@@ -456,33 +389,23 @@ async def fetch_and_post_horoscope(
         # 상세 내용 스레드 생성
         try:
             thread = await initial_message.create_thread(
-                name=f"{date_str} 별자리 운세 상세 내용",
-                auto_archive_duration=60,  # 1시간 후 자동 보관
-            )
-            logging.info(f"스레드 생성 성공: {thread.name}")
-        except discord.Forbidden:
-            thread = channel
-            logging.warning(
-                "스레드 생성 권한이 없어, 상세 내용을 현재 채널에 직접 게시합니다."
+                name=f"{date_str} 별자리 운세 상세",
+                auto_archive_duration=60,
             )
         except Exception as e:
             thread = channel
-            logging.error(f"스레드 생성 중 예기치 않은 오류: {e}")
 
-        # 상세 내용 텍스트
-        top_details_text = "**🥇 1위 ~ 6위 상세 운세**\n"
-        for item in top_rankings:
-            top_details_text += (
-                f"\n**{item['rank']} {item['sign_ko']}**\n"
-                f"> {item['description_ko']}\n"
-            )
+        # 스레드에 예쁘게 포맷팅하여 올리는 헬퍼 함수
+        # 헬퍼 함수 간소화
+        def build_details_text(rankings, title):
+            text = f"**{title}**\n"
+            for item in rankings:
+                text += f"\n**{item['rank']}위 {item['sign_ko']}**\n"
+                text += f"> {item['description_ko']}\n"
+            return text
 
-        bottom_details_text = "**⬇️ 7위 ~ 12위 상세 운세**\n"
-        for item in bottom_rankings:
-            bottom_details_text += (
-                f"\n**{item['rank']} {item['sign_ko']}**\n"
-                f"> {item['description_ko']}\n"
-            )
+        top_details_text = build_details_text(top_rankings, "🥇 상위 랭킹 상세")
+        bottom_details_text = build_details_text(bottom_rankings, "⬇️ 하위 랭킹 상세")
 
         await thread.send(top_details_text)
         await thread.send(bottom_details_text)
@@ -581,6 +504,14 @@ async def on_ready():
                 client.loop.create_task(
                     get_today_horoscope_for_guild(guild.id, cfg["gemini_api_key"])
                 )
+
+        # 봇이 켜지면 딱 한 번만 데이터 로딩 시도
+        for guild in client.guilds:
+            cfg = get_guild_settings(guild.id)
+            if cfg and cfg.get("gemini_api_key"):
+                # 캐시가 없는 상태에서 딱 하나만 시도
+                asyncio.create_task(get_today_horoscope_for_guild(guild.id, cfg["gemini_api_key"]))
+                break
 
     except Exception as e:
         logging.error(f"on_ready 중 오류: {e}")
