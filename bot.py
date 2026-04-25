@@ -155,9 +155,9 @@ async def translate_text(
         "Your goal is to translate Japanese horoscope content into natural, friendly Korean that maintains the original's energetic and positive tone. "
         "1. Keep exclamation marks (!), hearts, or other expressive punctuation if present in the original text. "
         "2. Translate into '해요체', ensuring the tone sounds like a fun, daily horoscope reading. "
-        "3. IMPORTANT: The 'description_ko' field MUST ONLY contain the horoscope advice. "
-        "4. DO NOT include any 'Lucky Color', 'Lucky Item', or 'Scores' in the 'description_ko' field. Extract ONLY the advice text. "
-        "5. Extract exactly 12 rankings. "
+        "3. IMPORTANT: Sort the final JSON array by 'rank' in ascending order (from 1 to 12). "
+        "4. The 'description_ko' field MUST ONLY contain the horoscope advice. "
+        "5. DO NOT include any 'Lucky Color', 'Lucky Item', or 'Scores' in the 'description_ko' field. "
         "6. Return ONLY the raw JSON array of 12 objects."
     )
 
@@ -292,6 +292,14 @@ async def get_today_horoscope_for_guild(
         translated_data = await translate_text(japanese_data, gemini_api_key) if japanese_data else None
 
         if translated_data:
+            # ==========================================
+            # 💡 이 부분을 추가하세요: 1위부터 12위까지 순서대로 정렬
+            try:
+                translated_data.sort(key=lambda x: int(x.get("rank", 99)))
+            except Exception as e:
+                logging.error(f"순위 정렬 중 오류 발생: {e}")
+            # ==========================================
+
             result = {
                 "date": today,
                 "source": "오하아사" if japanese_data else "고 고 별자리",
